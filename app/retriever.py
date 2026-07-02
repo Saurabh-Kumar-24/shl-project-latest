@@ -11,15 +11,18 @@ from app.catalog import Assessment, Catalog
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 SEMANTIC_TOP_K = 20
 FINAL_TOP_K = 10
+BUILD_BATCH_SIZE = 32
 
 
 class HybridRetriever:
     def __init__(self, catalog: Catalog) -> None:
         self.catalog = catalog
-        self._model = TextEmbedding(model_name=EMBEDDING_MODEL)
+        # threads=1 keeps onnxruntime's thread pool (and its per-thread memory) minimal,
+        # which matters on memory-constrained hosts like Render's free tier.
+        self._model = TextEmbedding(model_name=EMBEDDING_MODEL, threads=1)
         self._index: faiss.IndexFlatIP | None = None
         self._build_index()
 
@@ -31,7 +34,15 @@ class HybridRetriever:
 
     def _build_index(self) -> None:
         texts = [a.rich_text for a in self.catalog.assessments]
-        embeddings = self._embed(texts)
+
+        # Encode in small batches instead of all at once, to keep the peak
+        # memory during startup lower.
+        all_embeddings: list[np.ndarray] = []
+        for i in range(0, len(texts), BUILD_BATCH_SIZE):
+            batch = texts[i : i + BUILD_BATCH_SIZE]
+            all_embeddings.append(self._embed(batch))
+        embeddings = np.vstack(all_embeddings)
+
         dim = embeddings.shape[1]
         self._index = faiss.IndexFlatIP(dim)
         self._index.add(embeddings)
