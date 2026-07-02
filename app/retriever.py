@@ -3,59 +3,56 @@ from __future__ import annotations
 import logging
 import re
 
-import faiss
-import numpy as np
-from fastembed import TextEmbedding
+from rank_bm25 import BM25Okapi
 
 from app.catalog import Assessment, Catalog
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 SEMANTIC_TOP_K = 20
 FINAL_TOP_K = 10
-BUILD_BATCH_SIZE = 32
+
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9#+.]+")
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
 
 
 class HybridRetriever:
+    """Hybrid retriever combining BM25 ranked search with exact keyword matching.
+
+    Previously used neural embeddings (sentence-transformers, then fastembed)
+    for semantic search, but that required an ONNX/torch runtime whose
+    baseline memory footprint didn't fit within Render's free-tier 512MB RAM
+    limit. BM25 is a classic term-frequency ranking algorithm - no ML runtime,
+    tiny memory footprint - while still giving relevance-ranked results
+    instead of plain substring matching.
+    """
+
     def __init__(self, catalog: Catalog) -> None:
         self.catalog = catalog
-        # threads=1 keeps onnxruntime's thread pool (and its per-thread memory) minimal,
-        # which matters on memory-constrained hosts like Render's free tier.
-        self._model = TextEmbedding(model_name=EMBEDDING_MODEL, threads=1)
-        self._index: faiss.IndexFlatIP | None = None
+        self._bm25: BM25Okapi | None = None
         self._build_index()
 
-    def _embed(self, texts: list[str]) -> np.ndarray:
-        embeddings = np.array(list(self._model.embed(texts)), dtype=np.float32)
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-9
-        return embeddings / norms
-
     def _build_index(self) -> None:
-        texts = [a.rich_text for a in self.catalog.assessments]
-
-        # Encode in small batches instead of all at once, to keep the peak
-        # memory during startup lower.
-        all_embeddings: list[np.ndarray] = []
-        for i in range(0, len(texts), BUILD_BATCH_SIZE):
-            batch = texts[i : i + BUILD_BATCH_SIZE]
-            all_embeddings.append(self._embed(batch))
-        embeddings = np.vstack(all_embeddings)
-
-        dim = embeddings.shape[1]
-        self._index = faiss.IndexFlatIP(dim)
-        self._index.add(embeddings)
-        logger.info("FAISS index built: %d vectors, dim=%d", len(texts), dim)
+        corpus = [_tokenize(a.rich_text) for a in self.catalog.assessments]
+        self._bm25 = BM25Okapi(corpus)
+        logger.info("BM25 index built: %d documents", len(corpus))
 
     def _semantic_search(self, query: str, top_k: int = SEMANTIC_TOP_K) -> list[tuple[Assessment, float]]:
-        vec = self._embed([query])
-        scores, indices = self._index.search(vec, top_k)
+        tokens = _tokenize(query)
+        if not tokens:
+            return []
+        scores = self._bm25.get_scores(tokens)
+        ranked = sorted(
+            range(len(scores)), key=lambda i: scores[i], reverse=True
+        )[:top_k]
         results: list[tuple[Assessment, float]] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0:
+        for idx in ranked:
+            if scores[idx] <= 0:
                 continue
-            results.append((self.catalog.assessments[idx], float(score)))
+            results.append((self.catalog.assessments[idx], float(scores[idx])))
         return results
 
     def _keyword_match(self, query: str) -> list[Assessment]:

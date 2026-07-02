@@ -1,8 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 groq==0.15.0
-fastembed==0.8.0
-faiss-cpu==1.14.3
+rank-bm25==0.2.2
+numpy==2.2.1
 pydantic==2.10.4
 python-dotenv==1.0.1
 requests==2.32.3
