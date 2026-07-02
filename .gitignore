@@ -1,0 +1,11 @@
+.env
+grok_api_key
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.claude/
+*.ipynb_checkpoints/
